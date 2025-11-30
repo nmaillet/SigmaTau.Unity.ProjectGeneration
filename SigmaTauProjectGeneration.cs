@@ -11,18 +11,18 @@ using UnityEngine.Assertions;
 
 namespace SigmaTau.Unity.ProjectGeneration
 {
-    public class SigmaTauProjectGeneration
+    public class SigmaTauProjectGeneration : IDisposable
     {
         private readonly SigmaTauProjectGenerationOptions _options;
 
-        // File size generally seems to be 70kB - 90kB on Windows.
-        private readonly MemoryStream _memoryStream = new(100 * 1024);
-
         private readonly List<ProjectInfo> _projects = new();
 
-        private readonly string _unityProjectPath;
+        private string _unityAnlayzerPath;
 
-        private readonly string _unityProjectName;
+        // File size generally seems to be 70kB - 90kB on Windows.
+        private MemoryStream _memoryStream = new(100 * 1024);
+
+        private MD5 _md5;
 
         public SigmaTauProjectGeneration(SigmaTauProjectGenerationOptions options)
         {
@@ -32,9 +32,14 @@ namespace SigmaTau.Unity.ProjectGeneration
             }
 
             _options = options;
+        }
 
-            _unityProjectPath = PathUtils.GetParentFolder(Application.dataPath);
-            _unityProjectName = Path.GetFileName(_unityProjectPath);
+        public void Dispose()
+        {
+            _memoryStream?.Dispose();
+            _memoryStream = null;
+            _md5?.Dispose();
+            _md5 = null;
         }
 
         public void GenerateProjectFiles()
@@ -47,31 +52,72 @@ namespace SigmaTau.Unity.ProjectGeneration
             }
 
             CreateSolution();
+
+            var csProjFiles = Directory.EnumerateFiles(
+                PathUtils.AssetFolderFullPath, "*.csproj", SearchOption.AllDirectories);
+            foreach (var csProjFile in csProjFiles)
+            {
+                if (!_projects.Any((p) => PathUtils.IsSameFile(p.CsProjFilename, csProjFile)))
+                {
+                    Debug.LogWarningFormat("Deleting unused CS project file: {0}", csProjFile);
+                    File.Delete(csProjFile);
+                }
+            }
+
+            var csProjMetaFiles = Directory.EnumerateFiles(
+                PathUtils.AssetFolderFullPath, "*.csproj.meta", SearchOption.AllDirectories);
+            foreach (var csProjMetaFile in csProjMetaFiles)
+            {
+                if (!_projects.Any((p) => PathUtils.IsSameFile(p.CsProjFilename + ".meta", csProjMetaFile)))
+                {
+                    Debug.LogWarningFormat("Deleting unused CS project meta file: {0}", csProjMetaFile);
+                    File.Delete(csProjMetaFile);
+                }
+            }
+
+            var slnFiles = Directory.EnumerateFiles(PathUtils.ProjectFullPath, "*.sln", SearchOption.TopDirectoryOnly);
+            foreach (var slnFile in slnFiles)
+            {
+                if (!PathUtils.IsSameFile($"{PathUtils.ProjectName}.sln", slnFile))
+                {
+                    Debug.LogWarningFormat("Deleting unused solution file: {0}", slnFile);
+                    File.Delete(slnFile);
+                }
+            }
         }
 
         private void GetProjectsToInclude()
         {
             var assemblies = CompilationPipeline.GetAssemblies();
 
+            string currentAssemblyName = System.Reflection.Assembly.GetExecutingAssembly().GetName().Name;
+
             foreach (Assembly assembly in assemblies)
             {
-                string asmDefPath = CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName(assembly.name);
+                string assemblyDefeinitionPath =
+                    CompilationPipeline.GetAssemblyDefinitionFilePathFromAssemblyName(assembly.name);
+                bool hasAssemblyDefinition = !string.IsNullOrWhiteSpace(assemblyDefeinitionPath);
+                string rootSourcePath = hasAssemblyDefinition
+                    ? Path.GetDirectoryName(assemblyDefeinitionPath)
+                    : PathUtils.TryFindRootPathOfAllFiles(assembly.sourceFiles);
 
-                Assert.IsTrue(asmDefPath == null || !string.IsNullOrWhiteSpace(asmDefPath));
+                if (hasAssemblyDefinition && assembly.name == currentAssemblyName)
+                {
+                    string unityAnalyzerPath =
+                        Path.Combine(rootSourcePath, "Analyzers~", "Microsoft.Unity.Analyzers.dll");
+                    if (File.Exists(unityAnalyzerPath))
+                    {
+                        _unityAnlayzerPath = unityAnalyzerPath;
+                    }
+                }
 
-                string rootSourcePath = asmDefPath == null
-                    ? PathUtils.TryFindRootPathOfAllFiles(assembly.sourceFiles)
-                    : PathUtils.GetParentFolder(asmDefPath);
-
-                if (PathUtils.IsInAssetsFolder(rootSourcePath) || (asmDefPath != null && _options.IncludePackages))
+                if (PathUtils.IsInAssetsFolder(rootSourcePath) || (hasAssemblyDefinition && _options.IncludePackages))
                 {
                     _projects.Add(new ProjectInfo
                     {
-                        AsmDefPath = asmDefPath,
                         Assembly = assembly,
-                        CsProjFilename = $"{assembly.name}.csproj",
+                        CsProjFilename = $"{rootSourcePath}/{assembly.name}.csproj",
                         ProjectGuid = GetProjectGuid(assembly),
-                        ProjectTypeGuid = _options.ProjectTypeGuid,
                         RootSourcePath = rootSourcePath,
                     });
                 }
@@ -80,7 +126,7 @@ namespace SigmaTau.Unity.ProjectGeneration
 
         private void TryWriteFile(string filename)
         {
-            string path = Path.Combine(_unityProjectPath, filename);
+            string path = Path.Combine(PathUtils.ProjectFullPath, filename);
             using var fileStream = File.Open(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
 
             int outputLength = (int)_memoryStream.Length;
@@ -112,6 +158,37 @@ namespace SigmaTau.Unity.ProjectGeneration
             fileStream.Close();
         }
 
+        private void CreateNugetConfig()
+        {
+            _memoryStream.Position = 0;
+            _memoryStream.SetLength(0);
+
+            using var xml = XmlWriter.Create(
+                _memoryStream,
+                new XmlWriterSettings
+                {
+                    Encoding = Encoding.UTF8,
+                    Indent = true,
+                    IndentChars = "    ",
+                    OmitXmlDeclaration = false,
+                    CloseOutput = false,
+                }
+            );
+
+            xml.WriteStartElement("configuration");
+            xml.WriteStartElement("config");
+            xml.WriteStartElement("add");
+            xml.WriteAttributeString("key", "globalPackagesFolder");
+            xml.WriteAttributeString("value", Path.Combine("Temp", "NugetPackages"));
+            xml.WriteEndElement();
+            xml.WriteEndElement();
+            xml.WriteEndElement();
+
+            xml.Flush();
+
+            TryWriteFile("nuget.config");
+        }
+
         private void CreateSolution()
         {
             _memoryStream.Position = 0;
@@ -126,7 +203,7 @@ namespace SigmaTau.Unity.ProjectGeneration
             {
                 writer.WriteLine(
                     "Project(\"{0}\") = \"{1}\", \"{2}\", \"{3}\"",
-                    project.ProjectTypeGuid,
+                    _options.ProjectTypeGuid,
                     project.Assembly.name,
                     project.CsProjFilename,
                     project.ProjectGuid
@@ -156,7 +233,7 @@ namespace SigmaTau.Unity.ProjectGeneration
             writer.WriteLine("EndGlobal");
             writer.Flush();
 
-            TryWriteFile($"{_unityProjectName}.sln");
+            TryWriteFile($"{PathUtils.ProjectName}.sln");
         }
 
         private void CreateProject(ProjectInfo project)
@@ -172,6 +249,7 @@ namespace SigmaTau.Unity.ProjectGeneration
                     Indent = true,
                     IndentChars = "    ",
                     OmitXmlDeclaration = true,
+                    CloseOutput = false,
                 }
             );
 
@@ -179,7 +257,11 @@ namespace SigmaTau.Unity.ProjectGeneration
             xml.WriteAttributeString("ToolsVersion", "Current");
 
             xml.WriteStartElement("PropertyGroup");
-            xml.WriteElementString("BaseIntermediateOutputPath", "$(SolutionDir)/Temp/obj/$(Configuration)/$(MSBuildProjectName)");
+            xml.WriteElementString(
+                "BaseIntermediateOutputPath",
+                PathUtils.GetAbsoluteOrRelativePath(
+                    project.RootSourcePath,
+                    "Temp/obj/$(Configuration)/$(MSBuildProjectName)/"));
             xml.WriteElementString("IntermediateOutputPath", "$(BaseIntermediateOutputPath)");
             xml.WriteEndElement();
 
@@ -209,7 +291,10 @@ namespace SigmaTau.Unity.ProjectGeneration
             xml.WriteElementString("WarningLevel", "4");
             xml.WriteElementString("NoWarn", "0169;USG0001");
             xml.WriteElementString("AllowUnsafeBlocks", project.Assembly.compilerOptions.AllowUnsafeCode.ToString());
-            xml.WriteElementString("OutputPath", "Temp/bin/$(Configuration)/");
+            xml.WriteElementString(
+                "OutputPath",
+                PathUtils.GetAbsoluteOrRelativePath(
+                    project.RootSourcePath, "Temp/bin/$(Configuration)/$(MSBuildProjectName)/"));
             xml.WriteEndElement();
 
             xml.WriteStartElement("PropertyGroup");
@@ -235,8 +320,27 @@ namespace SigmaTau.Unity.ProjectGeneration
             xml.WriteEndElement();
 
             xml.WriteStartElement("ItemGroup");
-            var analyzers = project.Assembly.compilerOptions.RoslynAnalyzerDllPaths
-                .Concat(_options.Analyzers ?? Enumerable.Empty<string>());
+            xml.WriteStartElement("PackageReference");
+            xml.WriteAttributeString("Include", "Microsoft.Unity.Analyzers");
+            xml.WriteAttributeString("Version", "*");
+            xml.WriteStartElement("PrivateAssets");
+            xml.WriteString("all");
+            xml.WriteEndElement();
+            xml.WriteStartElement("IncludeAssets");
+            xml.WriteString("runtime; build; native; contentfiles; analyzers; buildtransitive");
+            xml.WriteEndElement();
+            xml.WriteEndElement();
+            xml.WriteEndElement();
+            xml.WriteStartElement("ItemGroup");
+
+            var analyzers = project.Assembly.compilerOptions.RoslynAnalyzerDllPaths;
+            // if (_unityAnlayzerPath != null)
+            // {
+            //     xml.WriteStartElement("Analyzer");
+            //     xml.WriteAttributeString("Include",
+            //         PathUtils.GetAbsoluteOrRelativePath(project.RootSourcePath, _unityAnlayzerPath));
+            //     xml.WriteEndElement();
+            // }
             foreach (string analyzer in analyzers)
             {
                 xml.WriteStartElement("Analyzer");
@@ -264,15 +368,14 @@ namespace SigmaTau.Unity.ProjectGeneration
 
             xml.WriteStartElement("ItemGroup");
             xml.WriteStartElement("Compile");
-            xml.WriteAttributeString("Include", project.RootSourcePath + "/**/*.cs");
+            xml.WriteAttributeString("Include", "**/*.cs");
             xml.WriteEndElement();
 
             foreach (ProjectInfo nestedProject in _projects)
             {
-                if (
-                    nestedProject == project
+                if (nestedProject == project
                     || string.IsNullOrWhiteSpace(nestedProject.RootSourcePath)
-                    || !PathUtils.IsSubfolder(project.RootSourcePath, nestedProject.RootSourcePath)
+                    || !PathUtils.IsNested(project.RootSourcePath, nestedProject.RootSourcePath)
                 )
                 {
                     continue;
@@ -281,10 +384,13 @@ namespace SigmaTau.Unity.ProjectGeneration
                 xml.WriteStartElement("Compile");
                 xml.WriteAttributeString(
                     "Remove",
-                    nestedProject.RootSourcePath[(project.RootSourcePath.Length + 1)..] + "/**/*.cs"
-                );
+                    Path.Combine(
+                        PathUtils.GetAbsoluteOrRelativePath(project.RootSourcePath, nestedProject.RootSourcePath),
+                        "**", "*.cs"));
+                // nestedProject.RootSourcePath[(project.RootSourcePath.Length + 1)..] + "/**/*.cs"
                 xml.WriteEndElement();
             }
+
             xml.WriteEndElement();
 
             var projectReferences = new List<string>();
@@ -301,7 +407,8 @@ namespace SigmaTau.Unity.ProjectGeneration
                 }
                 xml.WriteStartElement("Reference");
                 xml.WriteAttributeString("Include", name);
-                xml.WriteElementString("HintPath", referencePath);
+                xml.WriteElementString("HintPath",
+                    PathUtils.GetAbsoluteOrRelativePath(project.RootSourcePath, referencePath));
                 xml.WriteElementString("Private", "false");
                 xml.WriteEndElement();
             }
@@ -311,7 +418,8 @@ namespace SigmaTau.Unity.ProjectGeneration
             foreach (string projectReference in projectReferences)
             {
                 xml.WriteStartElement("ProjectReference");
-                xml.WriteAttributeString("Include", "$(SolutionDir)/" + projectReference);
+                xml.WriteAttributeString("Include",
+                    PathUtils.GetAbsoluteOrRelativePath(project.RootSourcePath, projectReference));
                 xml.WriteEndElement();
             }
             xml.WriteEndElement();
@@ -323,7 +431,7 @@ namespace SigmaTau.Unity.ProjectGeneration
             TryWriteFile(project.CsProjFilename);
         }
 
-        private static string GetProjectGuid(Assembly assembly)
+        private string GetProjectGuid(Assembly assembly)
         {
             static void WriteHex(Span<char> guidSpan, ReadOnlySpan<byte> hashSpan)
             {
@@ -342,9 +450,9 @@ namespace SigmaTau.Unity.ProjectGeneration
             Span<byte> nameEncoded = stackalloc byte[byteCount];
             int bytesWritten = Encoding.UTF8.GetBytes(assembly.name, nameEncoded);
 
-            using MD5 md5 = MD5.Create();
+            _md5 ??= MD5.Create();
             Span<byte> hashSpan = stackalloc byte[16];
-            if (!md5.TryComputeHash(nameEncoded[..bytesWritten], hashSpan, out bytesWritten))
+            if (!_md5.TryComputeHash(nameEncoded[..bytesWritten], hashSpan, out bytesWritten))
             {
                 throw new InvalidOperationException("Failed to compute project GUID");
             }
@@ -370,15 +478,11 @@ namespace SigmaTau.Unity.ProjectGeneration
         {
             public Assembly Assembly { get; set; }
 
-            public string ProjectTypeGuid { get; set; }
-
             public string ProjectGuid { get; set; }
 
             public string CsProjFilename { get; set; }
 
             public string RootSourcePath { get; set; }
-
-            public string AsmDefPath { get; set; }
         }
     }
 }

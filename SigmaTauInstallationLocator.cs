@@ -14,19 +14,20 @@ namespace SigmaTau.Unity.ProjectGeneration
             {
                 Filename = "nvim",
                 Name = "Neovim Στ",
+                GetStartArguments = (x) => $"--listen \"{x}\"",
             },
             new SigmaTauExecutable
             {
                 Filename = "nvim-qt",
                 Name = "Neovim-Qt Στ",
-                ArgumentPrefix = "-- ",
+                GetStartArguments = (x) => $"-- --listen \"{x}\"",
             },
             new SigmaTauExecutable
             {
                 Filename = "neovide",
                 Name = "Neovide Στ",
-                FocusCommand = "NeovideFocus",
-                ArgumentPrefix = "-- ",
+                FocusCommand = "<cmd>NeovideFocus<cr>",
+                GetStartArguments = (x) => $"-- --listen \"{x}\"",
             },
         };
 
@@ -44,8 +45,7 @@ namespace SigmaTau.Unity.ProjectGeneration
 
         private static void TryFindInstallationOnWindows(
             SigmaTauExecutable executable,
-            List<CodeEditor.Installation> installations
-        )
+            List<CodeEditor.Installation> installations)
         {
             if (Application.platform is not RuntimePlatform.WindowsEditor)
             {
@@ -65,7 +65,6 @@ namespace SigmaTau.Unity.ProjectGeneration
             };
 
             using var process = System.Diagnostics.Process.Start(startInfo);
-
 
             if (!process.WaitForExit(5000))
             {

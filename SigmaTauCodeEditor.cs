@@ -1,55 +1,52 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Unity.CodeEditor;
 using UnityEditor;
 using UnityEngine;
+using Process = System.Diagnostics.Process;
+using ProcessStartInfo = System.Diagnostics.ProcessStartInfo;
 
 namespace SigmaTau.Unity.ProjectGeneration
 {
     [InitializeOnLoad]
     public class SigmaTauCodeEditor : IExternalCodeEditor
     {
-        private const string _roslynAnalyzerKey = "sigma_tau_code_editor_roslyn_analyzer_path";
-
         private static readonly object _staticSyncRoot = new();
 
         private static Task<CodeEditor.Installation[]> _findInstallationsTask;
 
-        private string _roslynAnalyzerPath;
+        private string _currentPipeName = null;
 
-        private string RoslynAnalyzerPath
-        {
-            get
-            {
-                // Only fetch it the first time (we trim the string when persisting which would cause issues if we read
-                // every time).
-                _roslynAnalyzerPath ??= EditorPrefs.GetString(_roslynAnalyzerKey);
-                return _roslynAnalyzerPath;
-            }
-            set
-            {
-                // Always update the backing field; only persist if the trimmed value has changed.
-                value ??= string.Empty;
-                var valueSpan = value.AsSpan().Trim();
-                if (
-                    _roslynAnalyzerPath is null
-                    || !valueSpan.Equals(_roslynAnalyzerPath.AsSpan().Trim(), StringComparison.Ordinal)
-                )
-                {
-                    EditorPrefs.SetString(_roslynAnalyzerKey, valueSpan.ToString());
-                }
+        private Process _process;
 
-                _roslynAnalyzerPath = value;
-            }
-        }
+        private readonly string _defaultPipeName;
 
         static SigmaTauCodeEditor()
         {
             // Using Task.Run() in a static constructor appears to cause a deadlock.
             EditorApplication.delayCall += () => GetFindInstallationsTask();
             CodeEditor.Register(new SigmaTauCodeEditor());
+        }
+
+        public SigmaTauCodeEditor()
+        {
+            string projectName = Path.GetFileName(Path.GetDirectoryName(Application.dataPath));
+            _defaultPipeName = $"\\\\.\\pipe\\nvim.unity.{projectName}";
+        }
+
+        [MenuItem("SigmaTau/Generate Project Files", isValidateFunction: true)]
+        public static bool IsGenerateProjectFilesMenuItemValid()
+        {
+            return CodeEditor.Editor.CurrentCodeEditor is SigmaTauCodeEditor;
+        }
+
+        [MenuItem("SigmaTau/Generate Project Files")]
+        public static void GenerateProjectFilesMenuItem()
+        {
+            CodeEditor.Editor.CurrentCodeEditor.SyncAll();
         }
 
         private static Task<CodeEditor.Installation[]> GetFindInstallationsTask()
@@ -66,13 +63,7 @@ namespace SigmaTau.Unity.ProjectGeneration
             return _findInstallationsTask;
         }
 
-        public CodeEditor.Installation[] Installations
-        {
-            get
-            {
-                return GetFindInstallationsTask().Result;
-            }
-        }
+        public CodeEditor.Installation[] Installations => GetFindInstallationsTask().Result;
 
         public void Initialize(string editorInstallationPath)
         {
@@ -82,22 +73,6 @@ namespace SigmaTau.Unity.ProjectGeneration
 
         public void OnGUI()
         {
-            // The DLL is available as a Nuget package: https://www.nuget.org/packages/Microsoft.Unity.Analyzers
-            // Unity doesn't play well with Nuget packages normally, but maybe this could work, need to test.
-            RoslynAnalyzerPath = EditorGUILayout.TextField("Additional Roslyn Analyzer", RoslynAnalyzerPath);
-
-            GUILayout.BeginHorizontal();
-            EditorGUILayout.PrefixLabel(" ");
-            if (GUILayout.Button("Browse", GUILayout.Width(85)))
-            {
-                string result = EditorUtility.OpenFilePanel("Additional Roslyn Analyzer", string.Empty, string.Empty);
-                if (!string.IsNullOrWhiteSpace(result))
-                {
-                    RoslynAnalyzerPath = result;
-                }
-            }
-            GUILayout.EndHorizontal();
-
             GUILayout.BeginHorizontal();
             EditorGUILayout.PrefixLabel(" ");
             if (GUILayout.Button("Generate Project Files", GUILayout.MaxWidth(200)))
@@ -107,6 +82,117 @@ namespace SigmaTau.Unity.ProjectGeneration
             GUILayout.EndHorizontal();
         }
 
+        private bool TryFindExistingNamedPipe()
+        {
+            if (File.Exists(_defaultPipeName))
+            {
+                _currentPipeName = _defaultPipeName;
+                return true;
+            }
+
+            string[] existingPipes = Array.Empty<string>();
+
+            if (Application.platform is RuntimePlatform.WindowsEditor)
+            {
+                existingPipes = Directory.GetFiles("\\\\.\\pipe\\", "*nvim*");
+            }
+
+            _currentPipeName = existingPipes.FirstOrDefault((pipeName) =>
+            {
+                if (
+                    !ExecuteNvimRemote(pipeName, 5000, true, out string output, "--remote-expr", "getcwd()")
+                    || string.IsNullOrWhiteSpace(output)
+                )
+                {
+                    return false;
+                }
+
+                string processCwd = Path.GetFullPath(output);
+                string projectPath = Path.GetFullPath(output);
+                Debug.LogFormat("Comparing paths: {0} == {1}", processCwd, projectPath);
+                return string.Equals(processCwd, projectPath, PathUtils.PathComparison);
+            });
+
+            return _currentPipeName is not null;
+        }
+
+        private bool StartEditorProcess(string editorPath, SigmaTauExecutable executable)
+        {
+            _process?.Dispose();
+            _process = null;
+            _currentPipeName = _defaultPipeName;
+
+            string arguments = executable.GetStartArguments(_currentPipeName);
+            Debug.LogFormat("Starting editor '{0} {1}'", editorPath, arguments);
+            Process process = null;
+
+            try
+            {
+                process = Process.Start(editorPath, arguments);
+                using var cts = new CancellationTokenSource(5000);
+                while (!File.Exists(_defaultPipeName))
+                {
+                    if (cts.IsCancellationRequested)
+                    {
+                        Debug.LogWarning("Timed out waiting for editor to open");
+                        process.Kill();
+                        return false;
+                    }
+                }
+
+                // Move process to the field to is can be tracked and clear the local variable so it won't be disposed.
+                _process = process;
+                process = null;
+                return true;
+            }
+            finally
+            {
+                process?.Dispose();
+            }
+        }
+
+        private static bool ExecuteNvimRemote(
+            string pipeName,
+            int timeoutMs,
+            bool captureOutput,
+            out string output,
+            params string[] arguments
+        )
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "nvim",
+                ArgumentList = { "--headless", "--server", pipeName },
+                CreateNoWindow = true,
+                ErrorDialog = false,
+                UseShellExecute = false,
+                RedirectStandardOutput = captureOutput,
+            };
+
+            foreach (string argument in arguments)
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+
+            using var process = Process.Start(startInfo);
+
+            if (!process.WaitForExit(timeoutMs))
+            {
+                process.Kill();
+                output = null;
+                return false;
+            }
+
+            if (process.ExitCode != 0)
+            {
+                output = null;
+                return false;
+            }
+
+            output = captureOutput ? process.StandardOutput.ReadToEnd() : null;
+            return true;
+        }
+
         public bool OpenProject(string filePath = "", int line = -1, int column = -1)
         {
             if (string.IsNullOrWhiteSpace(filePath))
@@ -114,87 +200,74 @@ namespace SigmaTau.Unity.ProjectGeneration
                 return false;
             }
 
-            string editorPath = CodeEditor.CurrentEditorPath;
-            var executable = SigmaTauInstallationLocator.TryGetExecutable(editorPath);
-            if (executable is null)
+            if (!Path.GetExtension(filePath).Equals("cs", StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
 
-            string serverName = @"\\.\pipe\nvim.sigmatau.BajouOne";
+            Debug.LogFormat("Opening file {0}", filePath);
 
-            var commands = new List<string> { $"n {Path.GetFullPath(filePath)}" };
+            string editorPath = CodeEditor.CurrentEditorPath;
+            var executable = SigmaTauInstallationLocator.TryGetExecutable(editorPath);
+            if (executable is null)
+            {
+                Debug.LogWarningFormat("Could not find executable for editor path: {0}", editorPath);
+                return false;
+            }
 
+            if (_currentPipeName is null)
+            {
+                // First attempt to open a file, try to either find an existing open pipe, or start a new instance.
+                if (!TryFindExistingNamedPipe() && !StartEditorProcess(editorPath, executable))
+                {
+                    return false;
+                }
+            }
+            else if (_process is not null && _process.HasExited)
+            {
+                if (!StartEditorProcess(editorPath, executable))
+                {
+                    return false;
+                }
+            }
+
+            if (!ExecuteNvimRemote(_currentPipeName, 2000, false, out string _, "--remote", filePath))
+            {
+            }
+
+            string command = "<c-\\><c-N>";
+            bool executeCommand = false;
             if (line >= 1 && column >= 0)
             {
-                commands.Add($"lua vim.api.nvim_win_set_cursor(0, {{{line}, {column}}})");
+                command += $"<cmd>{line}<cr>{column + 1}|";
+                executeCommand = true;
             }
-
-            if (!string.IsNullOrWhiteSpace(executable.FocusCommand))
+            if (executable.FocusCommand is not null)
             {
-                commands.Add(executable.FocusCommand);
+                command += executable.FocusCommand;
+                executeCommand = true;
             }
-
-            if (File.Exists(serverName))
+            if (executeCommand)
             {
-                // Seems like the project is already open, use nvim remote to send the commands over.
-                var startInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "nvim",
-                    Arguments = string.Format(
-                        "--server {0} --remote-send \"<C-\\><C-N><CMD>{1}<CR>",
-                        serverName,
-                        string.Join("<CR><CMD>", commands)
-                    ),
-                    CreateNoWindow = true,
-                    ErrorDialog = false,
-                    RedirectStandardError = true,
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                };
+                // using var commandProcess = ExecuteNvimRemote("--remote-send", command);
 
-                using var process = System.Diagnostics.Process.Start(startInfo);
-
-                if (!process.WaitForExit(10_000))
-                {
-                    Debug.LogWarning("Neovim remote send timed out");
-                    return false;
-                }
-
-                if (process.ExitCode != 0)
-                {
-                    Debug.LogWarningFormat("Neovim remote send invalid exit code: {0}", process.ExitCode);
-                    return false;
-                }
             }
-            else
-            {
-                var startInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = editorPath,
-                    Arguments = string.Format(
-                        "{0}--listen {1} +\"{2}\"",
-                        executable.ArgumentPrefix,
-                        serverName,
-                        string.Join(" | ", commands)
-                    ),
-                };
-                using var _ = System.Diagnostics.Process.Start(startInfo);
-            }
+
+            // if (!process.WaitForExit(10_000))
+            // {
+            //     Debug.LogWarning("Neovim remote send timed out");
+            //     process.Kill();
+            //     return false;
+            // }
 
             return true;
         }
 
         public void SyncAll()
         {
-            string[] analyzers = string.IsNullOrWhiteSpace(RoslynAnalyzerPath)
-                ? Array.Empty<string>()
-                : new string[] { RoslynAnalyzerPath };
-            var projectGeneration = new SigmaTauProjectGeneration(new SigmaTauProjectGenerationOptions
+            using var projectGeneration = new SigmaTauProjectGeneration(new SigmaTauProjectGenerationOptions
             {
                 IncludePackages = false,
-                Analyzers = analyzers,
                 ProjectTypeGuid = "{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}",
                 CapabilitiesToRemove = new string[]
                 {

@@ -1,3 +1,5 @@
+using System;
+
 namespace SigmaTau.Unity.ProjectGeneration
 {
     public class SigmaTauExecutable
@@ -6,7 +8,7 @@ namespace SigmaTau.Unity.ProjectGeneration
 
         public string Name { get; set; }
 
-        public string ArgumentPrefix { get; set; }
+        public Func<string, string> GetStartArguments { get; set; }
 
         public string FocusCommand { get; set; }
     }
