@@ -1,6 +1,7 @@
-using System.Collections.Generic;
+using System;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using Unity.CodeEditor;
 using UnityEngine;
 
@@ -14,44 +15,50 @@ namespace SigmaTau.Unity.ProjectGeneration
             {
                 Filename = "nvim",
                 Name = "Neovim Στ",
-                GetStartArguments = (x) => $"--listen \"{x}\"",
+                GetStartArguments = (pipeName) => $"--listen \"{pipeName}\"",
             },
             new SigmaTauExecutable
             {
                 Filename = "nvim-qt",
                 Name = "Neovim-Qt Στ",
-                GetStartArguments = (x) => $"-- --listen \"{x}\"",
+                GetStartArguments = (pipeName) => $"-- --listen \"{pipeName}\"",
             },
             new SigmaTauExecutable
             {
                 Filename = "neovide",
                 Name = "Neovide Στ",
                 FocusCommand = "<cmd>NeovideFocus<cr>",
-                GetStartArguments = (x) => $"-- --listen \"{x}\"",
+                GetStartArguments = (pipeName) => $"-- --listen \"{pipeName}\"",
             },
         };
 
         public static CodeEditor.Installation[] FindInstallations()
         {
-            var installations = new List<CodeEditor.Installation>();
+            Func<SigmaTauExecutable, CodeEditor.Installation> tryFindInstallation =
+                Application.platform is RuntimePlatform.WindowsEditor ? TryFindInstallationOnWindows
+                    : null;
 
-            foreach (var executable in _executables)
+            if (tryFindInstallation is null)
             {
-                TryFindInstallationOnWindows(executable, installations);
+                return Array.Empty<CodeEditor.Installation>();
             }
 
-            return installations.ToArray();
+            var tasks = _executables.Select((executable) => Task.Run(() => tryFindInstallation(executable))).ToArray();
+            try
+            {
+                Task.WaitAll(tasks);
+            }
+            catch
+            {
+            }
+
+            return tasks.Select((t) => t.IsCompletedSuccessfully ? t.Result : default)
+                .Where((i) => !string.IsNullOrWhiteSpace(i.Name))
+                .ToArray();
         }
 
-        private static void TryFindInstallationOnWindows(
-            SigmaTauExecutable executable,
-            List<CodeEditor.Installation> installations)
+        private static CodeEditor.Installation TryFindInstallationOnWindows(SigmaTauExecutable executable)
         {
-            if (Application.platform is not RuntimePlatform.WindowsEditor)
-            {
-                return;
-            }
-
             var startInfo = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "where",
@@ -69,21 +76,28 @@ namespace SigmaTau.Unity.ProjectGeneration
             if (!process.WaitForExit(5000))
             {
                 Debug.LogWarningFormat("Timed out searching for '{0}'", executable.Filename);
-                return;
+                process.Kill();
+                return default;
             }
 
             if (process.ExitCode == 0)
             {
                 string path = process.StandardOutput.ReadToEnd();
-                installations.Add(new CodeEditor.Installation { Name = executable.Name, Path = path });
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    return new CodeEditor.Installation { Name = executable.Name, Path = path };
+                }
             }
+
+            return default;
         }
 
         public static SigmaTauExecutable TryGetExecutable(string editorPath)
         {
             // I'm assuming this would work the same on Linux, but not sure. No idea about MacOS.
             string filename = Path.GetFileNameWithoutExtension(editorPath);
-            return _executables.FirstOrDefault((ed) => ed.Filename.Equals(filename, PathUtils.PathComparison));
+            return _executables.FirstOrDefault((executable) =>
+                executable.Filename.Equals(filename, StringComparison.OrdinalIgnoreCase));
         }
     }
 }
