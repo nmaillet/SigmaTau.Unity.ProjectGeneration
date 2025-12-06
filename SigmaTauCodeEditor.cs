@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -223,8 +222,6 @@ namespace SigmaTau.Unity.ProjectGeneration
                 return false;
             }
 
-            Debug.LogFormat("Opening file {0}", filePath);
-
             string editorPath = CodeEditor.CurrentEditorPath;
             var executable = SigmaTauInstallationLocator.TryGetExecutable(editorPath);
             if (executable is null)
@@ -249,7 +246,7 @@ namespace SigmaTau.Unity.ProjectGeneration
             bool executeCommand = false;
             if (line >= 1 && column >= 0)
             {
-                commandStringBuilder.AppendFormat("<cmd>{0}<cr>{1}|", line, column + 1);
+                commandStringBuilder.AppendFormat("<cmd>{0}<cr>{1}|", line, column);
                 executeCommand = true;
             }
             if (executable.FocusCommand is not null)
